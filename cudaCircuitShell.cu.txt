@@ -1,0 +1,267 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <cuda.h>
+
+/* here we define block-size for reduction */
+#define Treduction 256
+
+/* here we define block-dimension for iterate */
+#define Titerate 16
+
+/* HOST function to convert from (i,j) cell index to linear storage index */
+int idx(int N, int i, int j){
+
+  return i + j*(N+2);
+}
+
+
+/* DEVICE function to convert from (i,j) cell index to linear storage index */
+__device__ int c_idx(int N, int i, int j){
+
+  return i + j*(N+2);
+}
+
+/* Reference serial function to compute l2 norm (Euclidean norm of difference between Inew and Iold */
+double calculateEpsilon(int N, double *Iold, double *Inew){
+
+  double epsilon = 0;
+  int i,j;
+  for(j=1;j<=N;++j){
+    for(i=1;i<=N;++i){
+      epsilon += pow(Inew[idx(N,i,j)]-Iold[idx(N,i,j)],2);
+    }
+  }
+  epsilon = sqrt(epsilon);
+  return epsilon;
+}
+
+/* Q1: use a 1D thread array to compute a partially reduced epsilon */
+__global__ void partialReductionKernel(int M, double *c_Iold, double *c_Inew, double *c_partEpsilon){
+
+  /* Q1a: declare shared memory array for thread-block tree reduction */
+  // volatile __shared__ dfloat s_v[Treduction];
+  volatile __shared__ double s_v[Treduction];
+
+  /* Q1b: use thread index and block index to identify array index */
+  int t = threadIdx.x;
+  int b = blockIdx.x;
+  int d = blockDim.x;
+  int id = t + b*d;
+  /* Q1c: each thread loads a value into shared memory array */
+  s_v[t] = 0;
+  //if(id<M)
+  //	s_v[t] = c_Iold[id];
+  
+  while(id<M){
+    s_v[t] += pow(c_Inew[id] - c_Iold[id], 2);
+    id += blockDim.x*gridDim.x;
+  }
+
+  /* Q1d: synchronize all threads in thread block */
+  __syncthreads();
+
+  /* Q1e: tree based reduction of shared memory array to one entry per thread-block */
+  
+
+  // unrolled version of tree reduction, assumes 256 threads in thread-block
+  if(t<128) s_v[t] += s_v[t+128];
+  __syncthreads();
+
+  if(t< 64) s_v[t] += s_v[t+ 64];
+  __syncthreads();
+  
+  // intra "warp" synchronization means we do not need to barrier
+  if(t< 32) s_v[t] += s_v[t+ 32];
+  if(t< 16) s_v[t] += s_v[t+ 16];
+  if(t<  8) s_v[t] += s_v[t+  8];
+  if(t<  4) s_v[t] += s_v[t+  4];
+  if(t<  2) s_v[t] += s_v[t+  2];
+  if(t<  1) s_v[t] += s_v[t+  1];
+
+  if(t==0)
+    c_partEpsilon[b] = s_v[t];
+
+  /* Q1f: one thread from thread-block writes out reduced single entry to partEpsilon */
+  
+}
+
+
+/* Q1: compute epsilon with CUDA */
+double cudaCalculateEpsilon(int N, double *c_Iold, double *c_Inew, double *c_partEpsilon, double *h_partEpsilon){
+
+  /* Cells in circuit */
+  int  M = (N+2)*(N+2);
+ 
+  /* Assume a one-dimensional thread array */
+  dim3 gDim( (M+Treduction-1)/Treduction); // number of blocks of size Treduction to cover M 
+  dim3 bDim(Treduction);                   // number of threads per block
+
+  /* Q1g: call kernel to partialReductionKernel */
+  partialReductionKernel <<< gDim, bDim >>> (M, c_Iold, c_Inew, c_partEpsilon);
+
+  /* Q1g: end */
+
+  /* Copy partially reduced array from DEVICE to HOST */
+  cudaMemcpy(h_partEpsilon, c_partEpsilon, gDim.x*sizeof(double), cudaMemcpyDeviceToHost); 
+  
+  /* Finish reduction on HOST */
+  double epsilon = 0;
+  int n;
+  for(n=0;n<gDim.x;++n){
+    epsilon += h_partEpsilon[n];
+  }
+
+  epsilon = sqrt(epsilon);
+
+  return epsilon;  
+}
+
+
+/* reference function to update Inew from Iold */
+void iterate(int N, double *Iold, double *Inew){
+
+  int i,j;
+  for(j=1;j<=N;++j){
+    for(i=1;i<=N;++i){
+      Inew[idx(N,i,j)] 
+      = 0.25f*(Iold[idx(N,i+1,j)] + 
+      	Iold[idx(N,i-1,j)] + 
+        Iold[idx(N,i,j+1)] + 
+	Iold[idx(N,i,j-1)] +
+        (i==1 && j==1) + (i==N && j==N));
+    }
+  }
+}
+
+/* implement CUDA iterate kernel using a two dimensional array of threads */
+__global__ void cudaIterateKernel(int N, double *c_Iold, double *c_Inew){
+  
+  /* Q1h: compute i and j using CUDA thread indices, block indices, and block dimensions */
+  /* Remember: use 1-indexing to match the above for loop in the original iterate function */
+  int i,j;
+  i = threadIdx.x + blockDim.x*blockIdx.x +1;
+  j = threadIdx.y + blockDim.y*blockIdx.y +1;
+  /* Q1h ends here */
+
+
+  /* Q1i: each thread updates one single entry of Inew using update formula */
+  if((i>=1 && i<=N) && (j>=1 && j<=N)){
+       c_Inew[c_idx(N,i,j)] 
+	= 0.25f*(c_Iold[c_idx(N,i+1,j)] + 
+	 c_Iold[c_idx(N,i-1,j)] +
+	 c_Iold[c_idx(N,i,j+1)] + 
+	 c_Iold[c_idx(N,i,j-1)] +
+	 (i==1 && j==1) + (i==N && j==N));
+
+  }
+
+  /* Q1i ends here */
+}
+
+
+/* function that invokes cudaIterateKernel */
+void cudaIterate(int N, double *c_Iold, double *c_Inew){
+  
+  /* CUDA thread dimensions for two-dimensional array of thread-blocks */
+  dim3 gDim( (N+Titerate-1)/Titerate, (N+Titerate-1)/Titerate);
+  dim3 bDim( Titerate, Titerate);
+
+  /* Q1j: invoke CUDA cudaIterateKernel */
+  cudaIterateKernel <<< gDim, bDim >>> (N, c_Iold, c_Inew);
+}
+
+/* function to solve for loop currents using Jacobi iterative method */
+void cudaSolve(int N, double tol){
+
+  /* use for computed epsilon */
+  int N2 = (N+2)*(N+2); // number of cells
+  double epsilon;
+
+  int NpartEpsilon = (N2+Treduction-1)/Treduction;
+
+  double *h_Inew = (double*) calloc(N2, sizeof(double));
+  double *h_Iold = (double*) calloc(N2, sizeof(double));
+  double *h_partEpsilon = (double*) calloc(NpartEpsilon, sizeof(double));
+
+  double *c_Inew, *c_Iold, *c_partEpsilon;
+
+
+  /* your Q1k code to build and zero out DEVICE vectors for c_Inew, c_Iold, c_partEpsilon starts here */
+  cudaMalloc(&c_Inew, N2*sizeof(double));
+  cudaMalloc(&c_Iold, N2*sizeof(double));
+  cudaMalloc(&c_partEpsilon, NpartEpsilon*sizeof(double));
+
+  cudaMemset(c_Inew, 0, N2*sizeof(double));
+  cudaMemset(c_Iold, 0, N2*sizeof(double));
+  cudaMemset(c_partEpsilon, 0, NpartEpsilon*sizeof(double));  
+
+  /* your Q1k code ends here */
+
+
+
+  /* iterate using the Jacobi method here */
+  do{
+
+    /* iterate from Iold to Inew */
+    cudaIterate(N, c_Iold, c_Inew);
+
+    /* iterate from Inew to Iold */
+    cudaIterate(N, c_Inew, c_Iold);
+
+    /* compute epsilon (change in current) */
+    epsilon = cudaCalculateEpsilon(N, c_Iold, c_Inew, c_partEpsilon, h_partEpsilon);
+
+    /* print current residual */
+    printf("epsilon = %g\n", epsilon);
+
+  }while(epsilon>tol);
+
+  /* copy results from DEVICE to the HOST */
+  cudaMemcpy(h_Iold, c_Iold, (N+2)*(N+2)*sizeof(double), cudaMemcpyDeviceToHost);
+ 
+
+  /* print out the loop current in cell (1 1) and (10 10) */
+  printf("I_{11} = %g\n", h_Iold[idx(N,1,1)]);
+  printf("I_{10 10} = %g\n", h_Iold[idx(N,10,10)]);
+  
+}
+
+/* usage: ./main 100 1e-6
+   to solve for a network of 100x100 to tolerance 1e-6 */
+
+int main(int argc, char **argv){
+
+  /* read N from the command line arguments */
+  int N = atoi(argv[1]);
+
+  /* read the user supplied convergence from the command line arguments */
+  double tol = atof(argv[2]);
+
+  /* insert timing event */
+  cudaEvent_t tic, toc;
+  cudaEventCreate(&tic);
+  cudaEventCreate(&toc);
+
+  /* insert timer event into DEVICE default queue */
+  cudaEventRecord(tic, 0);
+
+  /* perform Jacobi iteration to solve for loop currents in resistor network */
+  cudaSolve(N, tol);
+
+  /* insert timer event into DEVICE default queue */
+  cudaEventRecord(toc, 0);
+
+  /* force blocking on toc event */
+  cudaEventSynchronize(toc);
+  
+  /* get elapsed time */
+  float elapsed;
+  cudaEventElapsedTime(&elapsed, tic, toc);
+
+  printf("elapsed time in seconds =%g\n", elapsed/1000.0);
+
+  exit(0);
+  return 0;
+
+}
